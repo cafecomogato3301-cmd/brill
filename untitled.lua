@@ -74,6 +74,14 @@ local selectedDrill = nil
 local selectedHandDrill = nil
 local selectedPlayer = nil
 
+-- Auto-dodge state
+local autododge = false
+local dodgeCooldown = false
+local dodgeCooldownTime = 0.9 -- seconds between dodges
+local dodgeRange = 14 -- consider attacker if within this range
+local dodgeOffset = 12 -- how far to sidestep
+local recentToolActivations = {} -- tool -> timestamp
+
 -- ---------------------------
 -- Core helper functions (kept mostly as original)
 -- ---------------------------
@@ -284,6 +292,201 @@ local function getPlayersList()
 end
 
 -- ---------------------------
+-- Auto-Dodge: detection and dodge implementation
+-- ---------------------------
+
+-- safe helper to get humanoidrootpart
+local function getHRP(c)
+    if not c or not c.Parent then return nil end
+    return c:FindFirstChild("HumanoidRootPart")
+end
+
+-- Attempt to sidestep/teleport a short distance perpendicular to attacker
+local function tryDodgeFrom(attackerChar)
+    if not char or not char.Parent or dodgeCooldown then return end
+    if not attackerChar or not attackerChar.Parent then return end
+
+    local myHRP = getHRP(char)
+    local attHRP = getHRP(attackerChar)
+    if not myHRP or not attHRP then return end
+
+    local oldPivot = char:GetPivot()
+    local dir = (oldPivot.Position - attHRP.Position)
+    dir = Vector3.new(dir.X, 0, dir.Z)
+    if dir.Magnitude < 1 then
+        dir = Vector3.new(0, 0, -1)
+    end
+    local perp = Vector3.new(-dir.Z, 0, dir.X).Unit
+    local candidates = {
+        oldPivot.Position + perp * dodgeOffset,
+        oldPivot.Position - perp * dodgeOffset,
+        oldPivot.Position + dir.Unit * dodgeOffset * 0.6
+    }
+
+    dodgeCooldown = true
+    task.spawn(function()
+        task.wait(dodgeCooldownTime)
+        dodgeCooldown = false
+    end)
+
+    for _,pos in ipairs(candidates) do
+        local newCFrame = CFrame.new(pos + Vector3.new(0, 3, 0)) -- slightly above ground to avoid getting stuck
+        local ok = pcall(function()
+            char:PivotTo(newCFrame)
+        end)
+        if ok then
+            -- small wait to let teleport take effect
+            task.wait(0.04)
+            return
+        end
+    end
+end
+
+-- Heuristic: check animation track names or animation asset ids for attack keywords
+local attackKeywords = {"punch", "attack", "swing", "hit", "jab", "strike"}
+
+local function trackLooksLikeAttack(track)
+    if not track then return false end
+    local name = ""
+    pcall(function()
+        if track.Name then name = track.Name:lower() end
+    end)
+    if name and name ~= "" then
+        for _,k in ipairs(attackKeywords) do
+            if name:find(k) then
+                return true
+            end
+        end
+    end
+    -- try Animation property
+    local animId = ""
+    pcall(function()
+        if track.Animation and track.Animation.AnimationId then
+            animId = tostring(track.Animation.AnimationId):lower()
+        end
+    end)
+    if animId and animId ~= "" then
+        for _,k in ipairs(attackKeywords) do
+            if animId:find(k) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- If a tool on a character was activated recently, consider it a threat
+local function toolWasActivatedRecently(tool)
+    local t = recentToolActivations[tool]
+    if not t then return false end
+    return (tick() - t) < 0.6
+end
+
+-- Monitor a given character's tools to capture Activated events
+local function monitorToolsOnCharacter(ch)
+    if not ch then return end
+    for _,inst in ipairs(ch:GetChildren()) do
+        if inst:IsA("Tool") then
+            -- connect once per tool
+            if not inst:FindFirstChild("__auto_dodge_hooked") then
+                local marker = Instance.new("BoolValue")
+                marker.Name = "__auto_dodge_hooked"
+                marker.Parent = inst
+                pcall(function()
+                    inst.Activated:Connect(function()
+                        recentToolActivations[inst] = tick()
+                    end)
+                end)
+            end
+        end
+    end
+    -- watch for future tools
+    ch.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then
+            task.wait(0.01)
+            if not child:FindFirstChild("__auto_dodge_hooked") then
+                local marker = Instance.new("BoolValue")
+                marker.Name = "__auto_dodge_hooked"
+                marker.Parent = child
+                pcall(function()
+                    child.Activated:Connect(function()
+                        recentToolActivations[child] = tick()
+                    end)
+                end)
+            end
+        end
+    end)
+end
+
+-- Main loop that scans players for attack indicators
+task.spawn(function()
+    while true do
+        if autododge and char and char.Parent and char:FindFirstChildOfClass("Humanoid") then
+            for _,p in ipairs(Players:GetPlayers()) do
+                if p ~= plr then
+                    local ch = p.Character
+                    if ch and ch.Parent then
+                        -- ensure tools are monitored
+                        monitorToolsOnCharacter(ch)
+                        local humanoid = ch:FindFirstChildOfClass("Humanoid")
+                        if humanoid then
+                            -- 1) check animation tracks
+                            local isAttacking = false
+                            local ok, tracks = pcall(function() return humanoid:GetPlayingAnimationTracks() end)
+                            if ok and tracks then
+                                for _,t in ipairs(tracks) do
+                                    if trackLooksLikeAttack(t) then
+                                        isAttacking = true
+                                        break
+                                    end
+                                end
+                            end
+                            -- 2) check if any tool was activated recently
+                            for _,tool in ipairs(ch:GetChildren()) do
+                                if tool:IsA("Tool") then
+                                    if toolWasActivatedRecently(tool) then
+                                        isAttacking = true
+                                        break
+                                    end
+                                end
+                            end
+
+                            if isAttacking then
+                                -- distance check
+                                local myHRP = getHRP(char)
+                                local attHRP = getHRP(ch)
+                                if myHRP and attHRP then
+                                    local dist = (myHRP.Position - attHRP.Position).Magnitude
+                                    if dist <= dodgeRange then
+                                        pcall(function()
+                                            tryDodgeFrom(ch)
+                                        end)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(0.08)
+    end
+end)
+
+-- Keep pruning old tool activation timestamps periodically
+task.spawn(function()
+    while true do
+        local now = tick()
+        for tool,ts in pairs(recentToolActivations) do
+            if (now - ts) > 1.5 then
+                recentToolActivations[tool] = nil
+            end
+        end
+        task.wait(1.5)
+    end
+end)
+
+-- ---------------------------
 -- Try loading WindUI (with fallback)
 -- ---------------------------
 local ui = nil
@@ -309,8 +512,69 @@ end
 
 if not loadedUI then
     warn("[Delta-compatible] Could not fetch WindUI. GUI will not be shown. The automation logic still runs.")
-    -- If you want a very small local GUI fallback, we can add it here.
-    -- For now we rely on the automation running without the WindUI.
+    -- Fallback minimal ScreenGui so the user can toggle Auto-Dodge even if WindUI failed.
+    -- This creates a small panel at the top-left with a toggle button that controls 'autododge'.
+    local success, err = pcall(function()
+        local playerGui = plr:WaitForChild("PlayerGui")
+        -- remove existing fallback if present
+        local existing = playerGui:FindFirstChild("DeltaFallbackUI")
+        if existing then
+            existing:Destroy()
+        end
+
+        local screenGui = Instance.new("ScreenGui")
+        screenGui.Name = "DeltaFallbackUI"
+        screenGui.ResetOnSpawn = false
+        screenGui.Parent = playerGui
+
+        local frame = Instance.new("Frame")
+        frame.Name = "Panel"
+        frame.Size = UDim2.fromOffset(220, 80)
+        frame.Position = UDim2.new(0.02, 0, 0.02, 0)
+        frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+        frame.BorderSizePixel = 0
+        frame.Parent = screenGui
+
+        local title = Instance.new("TextLabel")
+        title.Name = "Title"
+        title.Size = UDim2.new(1, 0, 0, 24)
+        title.Position = UDim2.new(0, 0, 0, 0)
+        title.BackgroundTransparency = 1
+        title.Text = "Auto Dodge"
+        title.TextColor3 = Color3.fromRGB(255, 255, 255)
+        title.Font = Enum.Font.SourceSansBold
+        title.TextSize = 18
+        title.Parent = frame
+
+        local toggleBtn = Instance.new("TextButton")
+        toggleBtn.Name = "ToggleBtn"
+        toggleBtn.Size = UDim2.fromOffset(200, 36)
+        toggleBtn.Position = UDim2.new(0, 10, 0, 34)
+        toggleBtn.AutoButtonColor = true
+        toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        toggleBtn.Font = Enum.Font.SourceSans
+        toggleBtn.TextSize = 16
+        toggleBtn.Parent = frame
+
+        local function updateButton()
+            if autododge then
+                toggleBtn.Text = "Enabled"
+                toggleBtn.BackgroundColor3 = Color3.fromRGB(50, 180, 50)
+            else
+                toggleBtn.Text = "Disabled"
+                toggleBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+            end
+        end
+
+        updateButton()
+        toggleBtn.MouseButton1Click:Connect(function()
+            autododge = not autododge
+            updateButton()
+        end)
+    end)
+    if not success then
+        warn("Fallback UI failed: ", err)
+    end
 end
 
 -- ---------------------------
@@ -421,6 +685,16 @@ if ui then
                     end
                 end)
             end
+        end
+    })
+
+    -- Auto-Dodge toggle (integrated like the others)
+    tabMain:Toggle({
+        Title = "Auto Dodge (detect punches)",
+        Type = "Toggle",
+        Default = false,
+        Callback = function(state)
+            autododge = state
         end
     })
 
@@ -569,7 +843,7 @@ if ui then
     })
 else
     -- UI failed to load. Still run the automation if the user toggles variables manually in code or from REPL.
-    -- Optionally, you could implement a small Roblox-based ScreenGui here as a fallback.
+    -- The fallback GUI above was created to toggle autododge.
 end
 
 -- ---------------------------
