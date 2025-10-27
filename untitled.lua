@@ -74,25 +74,74 @@ local selectedDrill = nil
 local selectedHandDrill = nil
 local selectedPlayer = nil
 
+-- Auto dodge variables (from earlier change)
+local autoDodge = false
+local dodgeRadius = 6
+local dodgeCooldown = 1
+local lastDodgeTimes = {}
+local dodgeKeywords = {"punch", "attack", "swing", "hit", "strike"}
+
+-- Stamina force variables (new)
+local forceStamina = false
+local staminaInterval = 0.15 -- seconds between attempts
+local staminaTarget = 100    -- percent / value to set (default 100)
+
 -- ---------------------------
 -- Core helper functions (kept mostly as original)
 -- ---------------------------
 local function drill()
     if not char or not char.Parent then return end
+
+    local OreService
+    pcall(function()
+        OreService = game:GetService("ReplicatedStorage").Packages.Knit.Services.OreService.RE
+    end)
+
+    local function tryFireRequestRandomOre()
+        if OreService and OreService.RequestRandomOre then
+            pcall(function() OreService.RequestRandomOre:FireServer() end)
+        end
+    end
+
     local tool = char:FindFirstChildOfClass("Tool")
-    if tool and string.match(tool.Name or "", "Hand") then
+
+    if tool then
+        -- If it's a hand drill, use RequestRandomOre as before
+        if string.match(tool.Name or "", "Hand") then
+            pcall(tryFireRequestRandomOre)
+            return
+        end
+
+        -- For non-hand drills, try to Activate the tool and also fire request
         pcall(function()
-            game:GetService("ReplicatedStorage").Packages.Knit.Services.OreService.RE.RequestRandomOre:FireServer()
-        end)
-    else
-        for _,v in ipairs(plr.Backpack:GetChildren()) do
-            if string.match(v.Name or "", "Hand") then
-                pcall(function()
-                    char.Humanoid:EquipTool(v)
-                    game:GetService("ReplicatedStorage").Packages.Knit.Services.OreService.RE.RequestRandomOre:FireServer()
-                end)
-                break
+            if tool.Activate then
+                tool:Activate()
             end
+        end)
+
+        pcall(tryFireRequestRandomOre)
+        return
+    end
+
+    -- No tool equipped: try to equip a Hand or Drill from backpack
+    for _,v in ipairs(plr.Backpack:GetChildren()) do
+        if v:IsA("Tool") and (string.match(v.Name or "", "Hand") or string.match(v.Name or "", "Drill")) then
+            pcall(function()
+                local humanoid = char:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    humanoid:EquipTool(v)
+                    task.wait(0.06)
+                    if string.match(v.Name or "", "Hand") then
+                        pcall(tryFireRequestRandomOre)
+                    else
+                        if v.Activate then
+                            pcall(function() v:Activate() end)
+                        end
+                        pcall(tryFireRequestRandomOre)
+                    end
+                end
+            end)
+            break
         end
     end
 end
@@ -180,6 +229,187 @@ local function rebirth()
     end
 end
 
+-- Auto dodge helpers (kept from prior implementation)
+local function isAttackTrack(track)
+    if not track then return false end
+    local name = ""
+    pcall(function()
+        name = tostring(track.Name or ""):lower()
+    end)
+    if name and #name > 0 then
+        for _, kw in ipairs(dodgeKeywords) do
+            if string.find(name, kw, 1, true) then
+                return true
+            end
+        end
+    end
+
+    local animId = ""
+    pcall(function()
+        if track.Animation then
+            animId = tostring(track.Animation.Name or track.Animation.AnimationId or "")
+        end
+    end)
+    if animId and #animId > 0 then
+        animId = animId:lower()
+        for _, kw in ipairs(dodgeKeywords) do
+            if string.find(animId, kw, 1, true) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function tryDodgeFrom(attacker)
+    if not char or not char.Parent then return end
+    if not attacker or not attacker.Character then return end
+
+    local now = tick()
+    lastDodgeTimes[attacker] = lastDodgeTimes[attacker] or 0
+    if now - lastDodgeTimes[attacker] < dodgeCooldown then
+        return
+    end
+
+    local myRoot = char:FindFirstChild("HumanoidRootPart")
+    local attRoot = attacker.Character:FindFirstChild("HumanoidRootPart")
+    if not myRoot or not attRoot then return end
+
+    local dir = (myRoot.Position - attRoot.Position)
+    if dir.Magnitude == 0 then
+        dir = Vector3.new(1,0,0)
+    end
+    local right = dir:Cross(Vector3.new(0,1,0))
+    if right.Magnitude == 0 then
+        right = Vector3.new(1,0,0)
+    else
+        right = right.Unit
+    end
+
+    local side = right
+    if math.random() < 0.5 then side = -right end
+
+    local targetPos = myRoot.Position + side * math.clamp(dodgeRadius, 2, 12)
+    targetPos = Vector3.new(targetPos.X, math.max(myRoot.Position.Y, targetPos.Y + 2), targetPos.Z)
+
+    local ok, err = pcall(function()
+        char:PivotTo(CFrame.new(targetPos, targetPos + (char.HumanoidRootPart and char.HumanoidRootPart.CFrame.LookVector or Vector3.new(0,0,1))))
+    end)
+    if not ok then
+        pcall(function()
+            local h = char:FindFirstChildOfClass("Humanoid")
+            if h then
+                h:ChangeState(Enum.HumanoidStateType.Jumping)
+            end
+        end)
+    end
+
+    lastDodgeTimes[attacker] = now
+end
+
+local function autoDodgeLogic()
+    if not char or not char.Parent then return end
+    local myRoot = char:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= plr and p.Character and p.Character.Parent then
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            local animController = p.Character:FindFirstChildOfClass("Animator") or (hum and hum:FindFirstChildOfClass("Animator"))
+            local attRoot = p.Character:FindFirstChild("HumanoidRootPart")
+            if attRoot and animController and myRoot then
+                local dist = (attRoot.Position - myRoot.Position).Magnitude
+                if dist <= dodgeRadius then
+                    local ok, tracks = pcall(function()
+                        return animController:GetPlayingAnimationTracks()
+                    end)
+                    if ok and tracks and #tracks > 0 then
+                        for _, track in ipairs(tracks) do
+                            local success, isAttack = pcall(isAttackTrack, track)
+                            if success and isAttack then
+                                pcall(function() tryDodgeFrom(p) end)
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Stamina forcing implementation (NEW)
+local function trySetStaminaToFull()
+    if not char or not char.Parent then return false end
+    local succeeded = false
+
+    -- 1) Try Humanoid Attribute "Stamina" or "Energy"
+    pcall(function()
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            local attrs = {"Stamina", "Energy"}
+            for _, a in ipairs(attrs) do
+                if hum.GetAttribute and hum:GetAttribute(a) ~= nil then
+                    hum:SetAttribute(a, staminaTarget)
+                    succeeded = true
+                end
+            end
+        end
+    end)
+
+    -- 2) Try NumberValue / IntValue named "Stamina" or "Energy" under Character or Player
+    pcall(function()
+        local candidates = {
+            char:FindFirstChild("Stamina"),
+            char:FindFirstChild("Energy"),
+            plr:FindFirstChild("Stamina"),
+            plr:FindFirstChild("Energy"),
+            plr:FindFirstChild("leaderstats") and plr.leaderstats:FindFirstChild("Stamina"),
+            plr:FindFirstChild("leaderstats") and plr.leaderstats:FindFirstChild("Energy"),
+        }
+        for _, cv in ipairs(candidates) do
+            if cv and (cv:IsA("NumberValue") or cv:IsA("IntValue") or cv:IsA("NumberRangeValue")) then
+                cv.Value = staminaTarget
+                succeeded = true
+            end
+        end
+    end)
+
+    -- 3) Try common remote services (Knit pattern) to request refill
+    pcall(function()
+        local rs = game:GetService("ReplicatedStorage")
+        if rs and rs:FindFirstChild("Packages") and rs.Packages:FindFirstChild("Knit") and rs.Packages.Knit:FindFirstChild("Services") then
+            local servicesRoot = rs.Packages.Knit.Services
+            local possibleServices = {"StaminaService", "EnergyService", "PlayerStatsService"}
+            for _, svcName in ipairs(possibleServices) do
+                local svc = servicesRoot:FindFirstChild(svcName)
+                if svc and svc:FindFirstChild("RE") then
+                    local re = svc.RE
+                    local remoteFuncs = {"RefillStamina", "RestoreStamina", "RefillEnergy", "SetStamina", "SetEnergy"}
+                    for _, f in ipairs(remoteFuncs) do
+                        if re:FindFirstChild(f) and re[f].FireServer then
+                            pcall(function()
+                                -- some remotes accept no args, some accept value
+                                local ok, _ = pcall(function() re[f]:FireServer() end)
+                                if not ok then
+                                    pcall(function() re[f]:FireServer(staminaTarget) end)
+                                end
+                            end)
+                            succeeded = true
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    return succeeded
+end
+
+-- ---------------------------
+-- UI helpers (existing)
+-- ---------------------------
 local function formatPrice(num)
     local formatted = tostring(num)
     local k
@@ -349,10 +579,76 @@ if ui then
                 task.spawn(function()
                     while drilling do
                         drill()
-                        task.wait()
+                        task.wait(0.1)
                     end
                 end)
             end
+        end
+    })
+
+    -- Auto Dodge toggle (kept from earlier change)
+    tabMain:Toggle({
+        Title = "Auto Dodge",
+        Type = "Toggle",
+        Default = false,
+        Callback = function(state)
+            autoDodge = state
+            if autoDodge then
+                task.spawn(function()
+                    while autoDodge do
+                        pcall(autoDodgeLogic)
+                        task.wait(0.08)
+                    end
+                end)
+            end
+        end
+    })
+
+    -- NEW: Force Stamina toggle (the requested feature)
+    tabMain:Toggle({
+        Title = "Force Stamina 100%",
+        Type = "Toggle",
+        Default = false,
+        Callback = function(state)
+            forceStamina = state
+            if forceStamina then
+                task.spawn(function()
+                    while forceStamina do
+                        pcall(function()
+                            trySetStaminaToFull()
+                        end)
+                        task.wait(staminaInterval)
+                    end
+                end)
+            end
+        end
+    })
+
+    -- Slider to control how often stamina is forced (smaller = more aggressive)
+    tabMain:Slider({
+        Title = "Stamina Interval (s)",
+        Step = 0.05,
+        Value = {
+            Min = 0.05,
+            Max = 1,
+            Default = staminaInterval,
+        },
+        Callback = function(value)
+            staminaInterval = value
+        end
+    })
+
+    -- Optionally allow adjusting target value (useful if game uses different scale)
+    tabMain:Slider({
+        Title = "Stamina Target Value",
+        Step = 1,
+        Value = {
+            Min = 1,
+            Max = 1000,
+            Default = staminaTarget,
+        },
+        Callback = function(value)
+            staminaTarget = value
         end
     })
 
